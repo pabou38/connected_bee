@@ -10,6 +10,8 @@ print('\n\nunit test HX711')
 
 #https://github.com/j-dohnalek/hx711py  PYTHON 
 
+#https://www.hbm.com/en/7163/wheatstone-bridge-circuit/
+
 """
 calibration: need to set offset and scale
 

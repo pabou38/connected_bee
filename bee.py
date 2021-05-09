@@ -8,6 +8,11 @@ Pascal Boudalier
 pboudalier@gmail.com
 """
 
+# long pulse OK  4 wifi, 4 blynk
+# short pulse error 4 wifi 4 blynk 8 watchdog
+# red led for error
+
+
 version = "1.0"
 
 from utime import ticks_ms
@@ -19,6 +24,13 @@ import gc
 import os
 import sys
 
+"""
+import upip
+#upip.install('picoweb')
+#upip.install('utemplate')
+upip.install('micropython-logging')
+"""
+
 from machine import deepsleep, idle, reset_cause, DEEPSLEEP_RESET, DEEPSLEEP
 from utime import sleep_ms, sleep, sleep_us, localtime, mktime
 from machine import Pin, RTC, I2C, ADC, reset
@@ -27,6 +39,8 @@ from micropython import mem_info, const, stack_use
 import _thread 
 import blynklib_mp as blynklib # no .mpy
 import ntptime
+
+import network
 
 import urandom # build in, in help('modules'), ie list of module that can be imported
 # u means micropython ified. subset of Cpython
@@ -71,6 +85,7 @@ led_gpio = 5 # built in blue led  b.off() to lit
 lux_power_gpio = 16 # power vcc for lux
 bme_power_gpio = 17
 load_power_gpio = 18 # not used unstable reading
+red_led_gpio = 14 # for error
 
 hx711_clk = 32
 hx_data = 34
@@ -97,7 +112,26 @@ vpin_vbat = 59
 # Lolin D32 non Pro
 led = Pin(led_gpio, Pin.OUT, value=0)
 # to signal we are running. will be set to off just before going to deep sleep
-led.off()
+led.off() # connect to ground to lit off() will lit.
+
+red_led = Pin(red_led_gpio, Pin.OUT, value=1) # inverse logic. gpio connected to minus
+
+red_led.off() # to signal script has started
+sleep_ms(1000)
+red_led.on()
+
+def pulse_led(n, msec): # on board led
+  for i in range(n):
+    led.on() # off
+    sleep_ms(msec)
+    led.off() # on
+    sleep_ms(msec)
+
+def error_led(sec): # error led
+  red_led.off() # on
+  sleep(sec) 
+  red_led.on # off
+
 
 # test GPIO , input. prevent deep sleep if grounded
 test_pin = Pin(test_gpio, Pin.IN, Pin.PULL_UP)
@@ -241,7 +275,7 @@ def RTC_sensor_ok (index, string_recovered, sensor_value):
 # in case sensor failed. manage RTC and notifications
 ##########################################
 
-def RTC_sensor_failed (index, string_failed, counter):
+def RTC_sensor_failed (index, string_failed, counter , exception):
   global r
   # increment RTC error counter
   inc_RTC(counter)
@@ -251,9 +285,12 @@ def RTC_sensor_failed (index, string_failed, counter):
   s= str(mday) + ' ' + str(hour) +':' + str(minute)
   s1 = '%s: ' + string_failed
   s = (s1  %s) # use time stamp vs simple random number
-  print('RTC: sensor failed : ', s)
+  print('RTC: sensor failed : ', s , exception)
+  s = s + ' ' + exception
   blynk.virtual_write(vpin_terminal, s)
-      
+  
+    
+  # send notification for first fail only. no flooding
   # update RTC flag
   if r.memory()[index] == sensor_ok: # we were in a sensor ok state, so need to change state and send notif.
     blynk.notify(string_failed)
@@ -263,14 +300,7 @@ def RTC_sensor_failed (index, string_failed, counter):
   else: # already in failed state. do not send notif
     print('sensor still failing')
 
-  # RTC content send to blynk together with time stamp
-
-"""
-import upip
-#upip.install('picoweb')
-#upip.install('utemplate')
-upip.install('micropython-logging')
-"""
+# RTC content send to blynk together with time stamp
 
 print('content of /: ', os.listdir())
 try:
@@ -287,7 +317,7 @@ def start_repl():
   # cannot just browse to IP, need client http://micropython.org/webrepl/
   import webrepl 
   print('import webrepl_setup once to set password')
-  print('use http://micropython.org/webrepl/ to connect and use ws://192.168.1.9:8266/') 
+  print('use http://micropython.org/webrepl/ to connect and use ws://192.168.1.181:8266/') 
   print('or use local webrepl.html, file:///C:/Users/pboud/micropython/webrepl-master/webrepl.html')
   # cannot use ws://192.168.1.9:8266/ directly in browser
   webrepl.start()
@@ -297,11 +327,11 @@ def start_repl():
 # deep sleep ESP32
 # turns off led and power gpio
 #########################################################
-
 def go_to_deepsleep(sec):
   sleeptime_msec = sec * 1000 
   print('ESP32 will deep sleep for %d sec. turn off led and sensor power' %sec)
-  led.on()
+  led.on() # off
+  red_led.on() # off
   
   for p in pin_to_power_down:
     p.off()
@@ -312,10 +342,9 @@ def go_to_deepsleep(sec):
 # watchdog. prevent hang
 # forces deep sleep
 #############################################
-
 def watchdog(sec): # tuple
   global repl
-  print('\n==== watchdog thread started for %d sec' %sec)
+  print('==== watchdog thread started for %d sec' %sec)
   sleep(sec)
   print('!!!!! watchdog popped. repl: ', repl)
 
@@ -325,27 +354,33 @@ def watchdog(sec): # tuple
     return()
 
   # increment RTC error counter
-  inc_RTC(8)
+  inc_RTC(8) # number of watchdog popped
 
   try:
     blynk.notify('Bee: watchdog popped')
-    s = ('%d %d %d: watchdog popped' %(mday, hour, minute)) # use time stamp vs simple random number
+    s = ('%d %d %2d: watchdog popped' %(mday, hour, minute)) # use time stamp vs simple random number
     blynk.virtual_write(vpin_terminal, s)
     sleep(3) # blynk to complete before deep sleep ?
+    pulse_led(8,100) # 8 pulse of 100 ms
+    error_led(5) # red led
+    sleep(5)
+
   except Exception as e:
     print('watchdog: ', str(e))
+
   finally:
+    wifi.disconnect()
+    blynk.disconnect()
     go_to_deepsleep(sleep_sec_error)  
 
 
 #############################################
 # automatic reconnect to blynk
-# does not seem to be reliable, so the ping thread is also used
+# does not seem to be reliable, so the ping thread is used instead
 #############################################
-
 def blynk_reconnect(sec):
   global blynk
-  print('\n==== blynk reconnect thread started for %d sec' %sec)
+  print('==== blynk reconnect thread started for %d sec' %sec)
   while True:
     sleep(sec)
     print('   !!!!! blynk reconnect popped.')
@@ -362,10 +397,9 @@ def blynk_reconnect(sec):
 # aka ping 
 # force the connected state, so that pushing button will be captured while in repl, and reset executed
 #############################################
-
 def blynk_ping(sec):
   global repl
-  print('\n==== blynk ping thread started for %d sec' %sec)
+  print('==== blynk ping thread started for %d sec' %sec)
 
   flip = True
 
@@ -384,31 +418,25 @@ def blynk_ping(sec):
 
 
 #####################################################
-# start wifi
+# try to connect to a given wifi
 # https://docs.micropython.org/en/latest/library/network.html
 # https://docs.micropython.org/en/latest/library/network.WLAN.html
 #####################################################
 
-def wifi_connect(ssid, psk):
-    import network
-    from time import sleep_ms
+def wifi_connect(ssid, psk, sta_if):
     i =0
     ok = True
-    sta_if = network.WLAN(network.STA_IF)
-    sta_if.active(True)
-    print('set static IP')
-    sta_if.ifconfig(('192.168.1.181', '255.255.255.0','192.168.1.1', '8.8.8.8'))
     sta_if.connect(ssid, psk)
 
     while not sta_if.isconnected():
-      sleep_ms(300)
+      print('F' , end='') # marker we scan for wifi
+      sleep_ms(1000)
       i = i + 1
       if i >=10:
         ok=False
         break
          
     if ok == True: 
-      sleep_ms(10)  
       print('\n\nconnected. network config:', sta_if.ifconfig())
       print ('status: ', sta_if.status()) # no param, link status
       print('ssid: ', ssid)
@@ -416,6 +444,8 @@ def wifi_connect(ssid, psk):
       return (sta_if) 
     else:
       print('cannot connect to %s' %(ssid))
+      error_led(3)  # signal could not connect to this wifi
+      sta_if.disconnect() # wifi:sta is connecting, return error 2nd attempt
       return(None)
 # return None or sta_id
 
@@ -455,6 +485,8 @@ def read_lipo_gauge(i2c):
     print('exception reading Lipo gauge ' , str(e))
     return(None,None)
 
+###################################################
+# read BME
 
 def read_bme280(i2c):
   try:
@@ -483,16 +515,21 @@ def read_bme280(i2c):
     print('exception reading bme280 ', str(e))
     return(None,None,None)
 
+###################################################
+# read tsl
+# return exception
 def read_tsl2561(i2c):
   try:
-    tsl = tsl2561.TSL2561(i2c=i2c)
+    tsl = tsl2561.TSL2561(i2c=i2c) 
     lux = tsl.read()
-    return lux
+    return (lux, "OK")
   except Exception as e:
-    print('exception reading tsl2561: ', str(e))
-    return None
+    print('exception reading tsl2561: ', str(e)) # sensor saturated
+    return (None, str(e))
 
 
+###################################################
+# read load
 def read_hx711(nb, driver):
   #print('HX711 %d read' %nb)
   # use different averaging method
@@ -596,29 +633,39 @@ def process_sensors(blynk, r):
   if vcell != None: # sensor OK
     blynk.virtual_write(vpin_soc, int(soc)) 
     RTC_sensor_ok(2, "Bee: Lipo recovered", soc) # manage RTC state, error counters and notifications
+
   else: # error , blynk counter not updated. will stay at last value. will deep sleep the normal way
     RTC_sensor_failed(2, 'Bee: Lipo failed', 6) # index of state and error counter
+    error_led(2)
 
   #######################################
   # LUX
   #######################################
-  for i in range(warm):
-    lux = read_tsl2561(i2c)
-
+  
+  lux = 10000.0 
   for i in range(retry):
-    lux = read_tsl2561(i2c)
-    if lux == None:
-      print('   BLYNK: !! error lux sensor')
-      sleep_ms(100)
-    else:
-      print('   BLYNK: OK lux %0.1f'  %(lux))
-      break
+    (lux,s)  = read_tsl2561(i2c) # s is "OK" or exception eg sensor saturated
 
-  if lux != None: # sensor OK
+    try:
+      error = s.split(' ') [1] # in case of exception
+    except:
+      error = None
+    
+    if lux == None and error != 'saturated':   # real error, saturated is not considered as error per se
+      print('   BLYNK: !! error lux sensor' , s)
+      sleep_ms(1000)
+    else:
+      print('   BLYNK: OK or saturated lux %0.1f'  %(lux))
+      break # we got a good reading, possibly saturated
+
+  if lux != None or error == 'saturated': # sensor OK or saturated (lux = 10000)
     blynk.virtual_write(vpin_lux, int(lux)) # 
     RTC_sensor_ok(0, "Bee: Lux recovered", lux)
+
   else: # error sensor
-    RTC_sensor_failed(0, 'Bee: Lux failed', 4) 
+    RTC_sensor_failed(0, 'Bee: Lux failed', 4 , s) 
+    error_led(2)
+
 
   #######################################
   # Load
@@ -636,13 +683,12 @@ def process_sensors(blynk, r):
     load = read_hx711(10, driver) # input nb of read to average, returns in grams
     if load == None:
       print('   BLYNK: !! error load sensor, retry')
-      sleep_ms(100)
+      sleep_ms(100) # retry
     else:
-      print('   BLYNK: OK load  in grams %0.0f'  %(load))
+      print('   BLYNK: OK load  in grams %0.1f'  %(load))
       break
 
   # test for spurious read
-
   if load != None: # sensor OK
     load = load / 1000.0 # in kg
     load_int = int(load)
@@ -650,19 +696,22 @@ def process_sensors(blynk, r):
     # test for spurious read
     max_delta = 1 # ignore this read if two sequential read are more than 1 kg appart
     max_load = 60.0 # max load to be considered valid
+    min_load = 1.0
   
     if abs(load_int-prev_load) > max_delta and prev_load != 0: # prev_load = 0 at reset
-      s= ('load: spurious read. now %d, previous %d. do NOT update blynk and RTC' %load_int, prev_load)
+      s= 'load: spurious read. now %d, previous %d. do NOT update blynk and RTC' %(load_int, prev_load)
       print(s)
       blynk.virtualwrite(vpin_terminal, s)
 
-    elif load > 60.0:
+    elif load > max_load or load < min_load:
       s= ('load: suspect read. %0.1f. do NOT update blynk and RTC' %load)
       print(s)
       blynk.virtualwrite(vpin_terminal, s)
-      
+
     else:
+      
       load = round(load,1)
+      print('load is ok %0.1f' %load)
       blynk.virtual_write(vpin_load, load) # 
       set_RTC(9,load_int) # store as previous load in RTC memory
 
@@ -670,6 +719,7 @@ def process_sensors(blynk, r):
 
   else: # error 
     RTC_sensor_failed(3, 'Bee: Load failed', 7)
+    error_led(2)
   
   #######################################
   # BME
@@ -691,7 +741,7 @@ def process_sensors(blynk, r):
     blynk.virtual_write(vpin_temp, round(temp,1))
     blynk.virtual_write(vpin_pres, int(pres))
     # write to blynk terminal, incl get time stamp(TZ) and flags
-    s = ('%d/%d:%d temp %0.0f pres %0.0f' %(mday, hour, minute, temp, pres)) # use time stamp vs simple random number
+    s = ('%d/%d:%2d temp %0.0f pres %0.0f' %(mday, hour, minute, temp, pres)) # use time stamp vs simple random number
     # write flag as well
     s1=r.memory() #  will print b'\x01\x01\x00\x00\x00'
     s2= ''
@@ -701,6 +751,7 @@ def process_sensors(blynk, r):
     RTC_sensor_ok (1, "Bee: BME recovered", temp)
   else:
     RTC_sensor_failed(1, 'Bee: BME failed', 5) 
+    error_led(2)
 
   
   print('power down sensors')
@@ -723,6 +774,8 @@ def process_sensors(blynk, r):
 
 def blynk_thread(a):
   global sensor_done
+  global devices, missing_sensor
+
   print('\nBLYNK: starting ..', a)
   
   #########################
@@ -823,12 +876,32 @@ def blynk_thread(a):
   
   if blynk.connected() == False: # in case all connect attemps failed
     print('   BLYNK: could not connect after %d retry, go to deep sleep on error' %retry)
+    pulse_led(4,100) # short pulse for error
+    error_led(5) # red led
+    wifi.disconnect()
     go_to_deepsleep(sleep_sec_error)
   else:
     print('   BLYNK: all is good')
+    pulse_led(4,500) # long pulse for OK
+
+    try:
+      if missing_sensor:
+        print('some I2C sensor not detected ', str(devices))
+        blynk.virtualwrite(vpin_terminal, str(devices))
+      else:
+        print('all I2C sensors detected ', str(devices))
+    except Exception as e:
+      print(str(e))
+
     ##############################
-    sensor_done = process_sensors(blynk, r) # need to be global to be seen by other threads
+    try:
+      sensor_done = process_sensors(blynk, r) # need to be global to be seen by other threads
     ##############################
+    except Exception as e: # in case of any sensor error, do not crash, but go tpo deep sleep (or REPL) to retry next time
+      print('exception in process_sensor ', str(e))
+      s = 'exception sensor ' + str(e)
+      blynk.virtualwrite(vpin_terminal, s)
+      sensor_done = True
 
   print('   BLYNK: call blynk.run in endless loop')
   # blynk.run will make call back happen. need to call Blynk.run to have callback read start button value
@@ -845,6 +918,8 @@ def blynk_thread(a):
     blynk.notify('micropython blynk.run exception: %s ' %(str(e)))
     blynk.email('pboudalier@gmail.com', 'bee micropython blynk run exception', str(e))
     print('blynk run exception , deep sleep on error: ', sleep_sec_error)
+    error_led(5) # red led
+    wifi.disconnect()
     go_to_deepsleep(sleep_sec_error)
 
   print('end blynk thread')
@@ -859,7 +934,7 @@ def blynk_thread(a):
 ###############################################
 def end_app(a):
 
-  print('\n==== end app thread started')
+  print('==== end app thread started')
 
   global repl_value, sync_done # shared with blynk sync callback
   global repl # shared with watchdog, set here based on repl_value and pin status
@@ -868,6 +943,8 @@ def end_app(a):
   while sensor_done == False or sync_done == False: 
     sleep(2)
     print('W', end='')
+
+  pulse_led(6,500)
 
   print('sensor updated, button synched: ', sensor_done, sync_done)
 
@@ -958,6 +1035,10 @@ list devices in hexa
 0x36
 0x3c
 """
+if len(devices) != 3:
+  missing_sensor = True
+else:
+  missing_sensor = False
 
 print('create hx711 driver')
 driver = HX711(d_out=34, pd_sck=32)
@@ -970,7 +1051,7 @@ else:
   print('HX711 load driver created ', driver)
 
 offset = 254000 # avec plateau
-# 41xxx for 4700 grams
+# 41xxx for 4700 grams , 4 cells
 scale = 41500/4700
 
 
@@ -985,24 +1066,34 @@ net = [
 ]
 """
 
-
 import mynet
 print('start wifi ', mynet.net)
 
+sta_if = network.WLAN(network.STA_IF)
+sta_if.active(True)
+sta_if.ifconfig(('192.168.1.181', '255.255.255.0','192.168.1.1', '8.8.8.8'))
+
 #wifi_ok = False
+
+# try to connect to all configured wifi
 for i in range(len(mynet.net)):
-  print("\ntrying to connect to wifi %s ...\n\n" %(mynet.net[i][0]))
-  wifi = wifi_connect(mynet.net[i][0], mynet.net[i][1])
+  print("\ntrying to connect to wifi %s ..." %(mynet.net[i][0]))
+
+  wifi = wifi_connect(mynet.net[i][0], mynet.net[i][1], sta_if)
   
   if wifi != None:
     (ip, _,_,_) = wifi.ifconfig()
-
     print('\n************** wifi connected **************\n')
     #wifi_ok = True
+    pulse_led(4,500) # long pulse for OK
     break
 else: # no break
 #if (wifi_ok == False):
   print('could not connect to any wifi')
+  # blynk on board led
+  pulse_led(4,100) # short pulse for error
+  error_led(5) # red led
+  
   print('deep sleep sec: ', sleep_sec_error)
   go_to_deepsleep(sleep_sec_error)
 
@@ -1028,8 +1119,6 @@ for i in range(5): # retry in case of TIMEOUT
     (year, month, mday, hour, minute, second, weekday, yearday) = localtime()
     sleep(2)
 
-
-
 _thread.start_new_thread(end_app, ('pabou',))  # param need to be a tuple
 # will wait for blynk to run, button to sync and call deep sleep or webrepl
 
@@ -1040,6 +1129,6 @@ _thread.start_new_thread(watchdog, (120,))  # param need to be a tuple
 _thread.start_new_thread(blynk_ping, (10,))  # param need to be a tuple
 
 # run blynk in main
-blynk_thread(('pabou',)) # block at blynk.run() 
+blynk_thread(('pabou',)) # block at blynk.run() waiting for inbound event
 
 
