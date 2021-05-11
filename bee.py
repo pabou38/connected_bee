@@ -42,6 +42,8 @@ import ntptime
 
 import network
 
+import mynet
+
 import urandom # build in, in help('modules'), ie list of module that can be imported
 # u means micropython ified. subset of Cpython
 # correspond to micropython-random in pypi.org/projects/micropython-random
@@ -997,7 +999,7 @@ def end_app(a):
 
 init_RTC([1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
 
-blynk = blynklib.Blynk('128bf199aa8744f88a586beecb6b64d9')
+blynk = blynklib.Blynk(mynet.token) # auth token configured in mynet.py token = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 print ('BLYNK: blynk on public server created: ' , type(blynk))
 
 #There are two hardware I2C peripherals with identifiers 0 and 1. Any available output-capable pins can be used for SCL and SDA but the defaults are given below.
