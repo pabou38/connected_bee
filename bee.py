@@ -1,6 +1,5 @@
 #https://phixed.co/blog/micropython-workflow/
 #https://randomnerdtutorials.com/esp32-pinout-reference-gpios
-
 #https://www.youtube.com/watch?v=yZjpYmWVLh8
 
 """
@@ -8,12 +7,19 @@ Pascal Boudalier
 pboudalier@gmail.com
 """
 
-# long pulse OK  4 wifi, 4 blynk
-# short pulse error 4 wifi 4 blynk 8 watchdog
-# red led for error
+# long pulse OK 500ms:  4 wifi, 4 blynk
+# short pulse error 100ms : 4 wifi, 4 blynk, 8 watchdog
+# red led: any error
 
 
-version = "1.0"
+version = "2.0"
+log_file = 'log.txt'
+
+# add file logging and button to send log content to terminal
+# log file deleted when sent to terminal, avoid growing unbound
+# all majors exception catched and written to persistent log in file system. # main protected by try 
+# add entry in log file at hard boot
+
 
 from utime import ticks_ms
 start_time=ticks_ms() # note t=time() is in seconds. to measure execution time
@@ -76,10 +82,16 @@ sleep_sec_measure = 60*15 # deep sleep in sec between measure
 sleep_sec_error = 30 # deep sleep in sec if error
 
 first_connect = True # blynk connect call back
-sensor_done = False # global. set when sensor value have been sent to blynk.  
-sync_done = False # global. set to True when repl button is synched
-repl_value = -1 # will be set to repl button value, 0 or 1,  in sync call back
+sensor_done = False # global. set when sensor value have been sent to blynk.  app thread wait for it
+sync_repl_done = False # global. set to True when repl button is synched. app thread wait for it
+sync_log_done = False # global. set to True when log button is synched. app thread wait for it
+repl_value = -1 # will be set to repl button value, 0 or 1,  in sync call back. all thread wait for it
 repl = False # global. set by end_app to, prevent watchdog to go to deep sleep
+
+# used in log time stamp. make sure it is defined in any case
+mday =0
+hour = 0 
+minute = 0
 
 # pin definition
 test_gpio = 15 # connect to gnd to disable deep slep
@@ -109,7 +121,18 @@ vpin_led_repl = 57
 
 vpin_led_ping = 58
 vpin_vbat = 59
+vpin_log = 60
 
+########################################
+# create log file
+# a button can send log file content to terminal and delete it
+# capture all exceptions. post mortem analysis
+########################################
+f = open(log_file, 'a') # append, otherwize file delete at each deep sleep
+
+########################################
+# set GPIO
+########################################
 
 # Lolin D32 non Pro
 led = Pin(led_gpio, Pin.OUT, value=0)
@@ -122,6 +145,21 @@ red_led.off() # to signal script has started
 sleep_ms(1000)
 red_led.on()
 
+# test GPIO , input. prevent deep sleep if grounded
+test_pin = Pin(test_gpio, Pin.IN, Pin.PULL_UP)
+
+# to power lux and bme sensors from gpio
+lux_power_pin = Pin(lux_power_gpio, Pin.OUT, value=0)
+bme_power_pin = Pin(bme_power_gpio, Pin.OUT, value=0)
+load_power_pin = Pin(load_power_gpio, Pin.OUT, value=0) # not used
+
+# will be set to low at deep sleep
+pin_to_power_down = [lux_power_pin, bme_power_pin, load_power_pin]
+
+
+########################################
+# LED functions
+########################################
 def pulse_led(n, msec): # on board led
   for i in range(n):
     led.on() # off
@@ -134,17 +172,6 @@ def error_led(sec): # error led
   sleep(sec) 
   red_led.on # off
 
-
-# test GPIO , input. prevent deep sleep if grounded
-test_pin = Pin(test_gpio, Pin.IN, Pin.PULL_UP)
-
-# to power lux and bme sensors from gpio
-lux_power_pin = Pin(lux_power_gpio, Pin.OUT, value=0)
-bme_power_pin = Pin(bme_power_gpio, Pin.OUT, value=0)
-load_power_pin = Pin(load_power_gpio, Pin.OUT, value=0) # not used
-
-# will be set to low at deep sleep
-pin_to_power_down = [lux_power_pin, bme_power_pin, load_power_pin]
 
 #rand = urandom.randint(1,100)
 
@@ -166,12 +193,31 @@ vbat = 4.2/2605 * ADC
 #vbat = round((2*adc_read/4096.0) * 3.3, 1) # adc / 4096.0 * 7.445 ?  vbat = 4.2  gpio = 2.1
 print('adc: %d , vbat: %0.1f' %(adc_read, vbat))
 
-
+# write to log file for hard boot. No time stamp yet
 # check if the device woke from a deep sleep
 if reset_cause() == DEEPSLEEP_RESET:
-    print('ESP32: woke from a deep sleep')
+  print('ESP32: woke from a deep sleep')
 else:
-  print('ESP32: fresh boot')
+  print('ESP32: hard boot')
+  s = 'Bee hard boot\n'
+  x = f.write(s)
+  print('wrote %d bytes: %s' %(x,s))
+
+"""
+  f.close()
+  f = open(log_file)
+  s = f.read()
+  print('reading file: %d %s ' %(len(s),s) )
+
+  s = 'test\n'
+  x = f.write(s)
+  print('wrote %d bytes: %s' %(x,s))
+
+  f.close()
+  f = open(log_file)
+  s = f.read()
+  print('reading file: %d %s ' %(len(s),s) )
+"""
 
 
 ####################################
@@ -254,7 +300,6 @@ def inc_RTC(i): # increment RTC counter
 # in case sensor is OK. manage RTC and notifications
 ##########################################
 def RTC_sensor_ok (index, string_recovered, sensor_value):
-  global r
 
   sensor_value = round(sensor_value,1)
 
@@ -330,8 +375,10 @@ def start_repl():
 # turns off led and power gpio
 #########################################################
 def go_to_deepsleep(sec):
-  sleeptime_msec = sec * 1000 
-  print('ESP32 will deep sleep for %d sec. turn off led and sensor power' %sec)
+
+  sleeptime_msec = sec * 1000
+  print('ESP32 will deep sleep for %d sec. close log file, turn off led and sensor power' %sec)
+  f.close()
   led.on() # off
   red_led.on() # off
   
@@ -368,7 +415,9 @@ def watchdog(sec): # tuple
     sleep(5)
 
   except Exception as e:
-    print('watchdog: ', str(e))
+    s = '%d %d %2d: exception watchdog: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
 
   finally:
     wifi.disconnect()
@@ -483,8 +532,11 @@ def read_lipo_gauge(i2c):
     # close the connection to the module
     #m.deinit()
     return(vcell, soc)
+
   except Exception as e:
-    print('exception reading Lipo gauge ' , str(e))
+    s = '%d %d %2d: exception reading Lipo gauge: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
     return(None,None)
 
 ###################################################
@@ -514,7 +566,9 @@ def read_bme280(i2c):
     return(temp, pres, hum)
 
   except Exception as e:
-    print('exception reading bme280 ', str(e))
+    s = '%d %d %2d: exception reading bme280: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
     return(None,None,None)
 
 ###################################################
@@ -526,7 +580,10 @@ def read_tsl2561(i2c):
     lux = tsl.read()
     return (lux, "OK")
   except Exception as e:
-    print('exception reading tsl2561: ', str(e)) # sensor saturated
+    # sensor saturated
+    s = '%d %d %2d: exception reading tsl2561: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
     return (None, str(e))
 
 
@@ -584,7 +641,9 @@ def read_hx711(nb, driver):
     return(grams)
 
   except Exception as e:
-    print('exception hx711 read: ', str(e))
+    s = '%d %d %2d: exception reading hx711: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
     driver.power_off()
     return(None)
 
@@ -762,11 +821,11 @@ def process_sensors(blynk, r):
   bme_power_pin.off()
 
   print('   BLYNK: sensor update done', r.memory())
-  return(True) # sensor done
+  return(True) # always return True sensor done
 
 #sensor_done = True # to signal to main thread. main waiting on this global var
 # could have had sensor error
-# end_app thread wait on update_done != 0
+# end_app thread wait on both sensor and button synch done
 
 
 
@@ -788,7 +847,7 @@ def blynk_thread(a):
   def connect_handler():
     global first_connect
     global repl
-   
+    
     print("   BLYNK: in connect call back")
     
     """
@@ -799,12 +858,15 @@ def blynk_thread(a):
     if first_connect: # avoid connect, disconnect
       print('   BLYNK: first connect')
       first_connect = False 
-      print('   BLYNK: sync start button')
+      print('   BLYNK: sync button')
       blynk.virtual_sync(vpin_repl) # repl button
+      # WTF for some reason I could not synch the 2 button at once? only the first call back got called
+      # 2nd sync is done in first button call back
+      
       # could do sensor processing here
     else:
       print('    BLYNK: not first connect')
-   
+    
   #########################
   # disconnect call back
   #########################
@@ -819,22 +881,21 @@ def blynk_thread(a):
     else:
       print('   BLYNK: disconnect: !!!! cannot REconnect !!!!')
     """
-      
 
-#########################
-# button call back 
-# update led
-# set repl_value global
-# if button = OFF while in repl, reset
-#########################
-# read repl button 56. if pushed, will run apps until pushed again, if not pushed, will go to deep sleep immediatly
-# communicate with two globals, bolean and int for value of button
-# called by sync or if button is pushed and app running, ie a way to stop the app and go to deep sleep
-# set sync_done = True. main wait for sync_done == True
+  #########################
+  # REPL button call back 
+  # update led
+  # set repl_value global
+  # if button = OFF while in repl, reset
+  #########################
+  # read repl button 56. if pushed, will run apps until pushed again, if not pushed, will go to deep sleep immediatly
+  # communicate with two globals, bolean and int for value of button
+  # called by sync or if button is pushed and app running, ie a way to stop the app and go to deep sleep
+  # set sync_done = True. main wait for sync_done == True
 
   @blynk.handle_event('write V56')
   def write_virtual_pin_handler_v56(pin, value): # value is a list of str
-    global sync_done # to communicate to main thread that this button has synched
+    global sync_repl_done # to communicate to main thread that this button has synched
     global repl_value # value of button, int, 1 if button is ON
     global repl # bolean. set by end_app when REPL is running
     print('   v56 call back start button: vpin %d start button: %s.' %(pin, value[0]))
@@ -852,10 +913,48 @@ def blynk_thread(a):
         sleep(2)
         reset()
 
-    sync_done = True # button value synched
+    sync_repl_done = True # button value synched
+    # repl_value and sync_repl_done are set 
 
-    # repl_value and sync_done are set
-    
+    # for some reason I could not synch the 2 button at once? only the first call back got called
+    blynk.virtual_sync(vpin_log) 
+
+  
+  #########################
+  # log file button call back 
+  # if button = ON send log file to terminal and purge it 
+  # if button = OFF, pass
+  #########################
+
+  @blynk.handle_event('write V60')
+  def write_virtual_pin_handler_v60(pin, value): # value is a list of str
+    global f
+    global sync_log_done # to communicate to main thread that this button has synched
+    print('   v60 call back start button: vpin %d start button: %s.' %(pin, value[0]))
+    log_value = int(value[0]) # value of button
+    if log_value == 1: # button is ON
+      print('   v60: log button in ON. send log file content to terminal and delete file')
+      try: # ceinture et bretelles
+        f.close()
+        f = open(log_file)
+        s = f.read()
+        print('log file content: %d %s'  %(len(s),s))
+        blynk.virtual_write(vpin_terminal, s)
+        blynk.virtual_write(vpin_terminal, 'deleting log file\n')
+        f.close()
+        # delete log file to make sure it does not grow
+        # log information is therefore only available once on terminal
+        os.remove(log_file)
+        f = open(log_file, 'r')
+      except Exception as e:
+        pass
+
+    else:
+      print('   v60: log button in OFF., pass')
+      # do nothing
+
+    sync_log_done = True #button value synched
+
 
   ################################### 
   # END of callbacks
@@ -865,45 +964,56 @@ def blynk_thread(a):
   # connect default timeout 30sec
   # try to connect to blynk with retry
 
-  retry = 0
-  while retry < 5:
-    print('try to connect to blynk %d retry' %retry)
-    if (blynk.connect(timeout=30)): # boolean
-      print('   BLYNK: connect() returned. blynk is connected') # all processing was done in connect call back. 
-      break
-    else: 
-      print('   BLYNK: !!!! cannot connect !!!! . retry')
-      retry = retry + 1
-      sleep(10)
-  
-  if blynk.connected() == False: # in case all connect attemps failed
-    print('   BLYNK: could not connect after %d retry, go to deep sleep on error' %retry)
-    pulse_led(4,100) # short pulse for error
-    error_led(5) # red led
+  try:
+
+    retry = 0
+    while retry < 5:
+      print('try to connect to blynk %d retry' %retry)
+      if (blynk.connect(timeout=30)): # boolean
+        print('   BLYNK: connect() returned. blynk is connected') # all processing was done in connect call back. 
+        break
+      else: 
+        print('   BLYNK: !!!! cannot connect !!!! . retry')
+        retry = retry + 1
+        sleep(10)
+    
+    if blynk.connected() == False: # in case all connect attemps failed
+      print('   BLYNK: could not connect after %d retry, go to deep sleep on error' %retry)
+      pulse_led(4,100) # short pulse for error
+      error_led(5) # red led
+      wifi.disconnect()
+      go_to_deepsleep(sleep_sec_error)
+    else:
+      print('   BLYNK: all is good')
+      pulse_led(4,500) # long pulse for OK
+
+      try:
+        if missing_sensor:
+          print('some I2C sensor not detected ', str(devices))
+          blynk.virtualwrite(vpin_terminal, str(devices))
+        else:
+          print('all I2C sensors detected ', str(devices))
+      except Exception as e:
+        print(str(e))
+
+  except Exception as e:
+    print('exception in blynk connect ', str(e))
     wifi.disconnect()
     go_to_deepsleep(sleep_sec_error)
-  else:
-    print('   BLYNK: all is good')
-    pulse_led(4,500) # long pulse for OK
 
-    try:
-      if missing_sensor:
-        print('some I2C sensor not detected ', str(devices))
-        blynk.virtualwrite(vpin_terminal, str(devices))
-      else:
-        print('all I2C sensors detected ', str(devices))
-    except Exception as e:
-      print(str(e))
 
-    ##############################
-    try:
-      sensor_done = process_sensors(blynk, r) # need to be global to be seen by other threads
-    ##############################
-    except Exception as e: # in case of any sensor error, do not crash, but go tpo deep sleep (or REPL) to retry next time
-      print('exception in process_sensor ', str(e))
-      s = 'exception sensor ' + str(e)
-      blynk.virtualwrite(vpin_terminal, s)
-      sensor_done = True
+  ##############################
+  try:
+    sensor_done = process_sensors(blynk, r) # need to be global to be seen by other threads
+  ##############################
+  except Exception as e: # in case of any sensor error, do not crash, but go tpo deep sleep (or REPL) to retry next time
+    print('exception in process_sensor ', str(e))
+    s = '%d %d %2d: exception sensor: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
+    blynk.virtualwrite(vpin_terminal, s)
+  finally:
+    sensor_done = True
 
   print('   BLYNK: call blynk.run in endless loop')
   # blynk.run will make call back happen. need to call Blynk.run to have callback read start button value
@@ -916,7 +1026,10 @@ def blynk_thread(a):
       print('run', end=' ')
       
   except Exception as e: # notify error and deep sleep to retry
-    print('   BLYNK: blynk.run exception %s', str(e))
+    s = '%d %d %2d: exception in BLYNK run: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
+
     blynk.notify('micropython blynk.run exception: %s ' %(str(e)))
     blynk.email('pboudalier@gmail.com', 'bee micropython blynk run exception', str(e))
     print('blynk run exception , deep sleep on error: ', sleep_sec_error)
@@ -936,49 +1049,67 @@ def blynk_thread(a):
 ###############################################
 def end_app(a):
 
-  print('==== end app thread started')
+  try:
 
-  global repl_value, sync_done # shared with blynk sync callback
-  global repl # shared with watchdog, set here based on repl_value and pin status
-  global sensor_done # shared with blynk connect call back
-  
-  while sensor_done == False or sync_done == False: 
-    sleep(2)
-    print('W', end='')
+    print('==== end app thread started')
 
-  pulse_led(6,500)
+    global repl_value, sync_repl_done, sync_log_done # shared with blynk sync callback
+    global repl # shared with watchdog, set here based on repl_value and pin status
+    global sensor_done # shared with blynk connect call back 
 
-  print('sensor updated, button synched: ', sensor_done, sync_done)
+    # wait until all button have been synched, and sensor have been read (trigerred in bly)
 
-  # connect GPIO 15 (pullup) to gnd to avoid any deep sleep. allow to reflash in peace
-  if test_pin.value() == 0 or repl_value == 1:
+    while sensor_done == False or sync_repl_done == False or sync_log_done == False: 
+      #print(sensor_done, sync_repl_done, sync_log_done)
+      sleep(2)
+      print('W', end='')
 
-    repl = True # to prevent watchdog to kill it all
-    # signal REPL is ON
-    print('repl is ON. keeps running, write to terminal, notify and email') 
-    blynk.notify('micropython BEE not going to deep sleep, REPL is ON')
-    blynk.email('pboudalier@gmail.com', 'micropython BEE', 'REPL is ON') 
-    s = ('%d/%d:%d REPL ON' %(mday, hour, minute)) # use time stamp vs simple random number
-    blynk.virtual_write(vpin_terminal, s) 
-    start_repl()
-    while True:
-      sleep(10)  # idle forever. can update with webrepl
+    pulse_led(6,500)
 
-  else:
+    print('sensor updated, button synched: ', sensor_done, sync_repl_done, sync_log_done)
 
-    print('REPL is OFF, will sleep shortly') # button is OFF
-    sleep(5) # time for blynk.run to process virtual write ??
-    
+    # connect GPIO 15 (pullup) to gnd to avoid any deep sleep. allow to reflash in peace
+    if test_pin.value() == 0 or repl_value == 1:
+
+      repl = True # to prevent watchdog to kill it all
+      # signal REPL is ON
+      print('repl is ON. keeps running, write to terminal, notify and email') 
+      blynk.notify('micropython BEE not going to deep sleep, REPL is ON')
+      blynk.email('pboudalier@gmail.com', 'micropython BEE', 'REPL is ON') 
+      s = ('%d/%d:%d REPL ON' %(mday, hour, minute)) # use time stamp vs simple random number
+      blynk.virtual_write(vpin_terminal, s) 
+      start_repl()
+      while True:
+        sleep(10)  # idle forever. can update with webrepl
+
+    else:
+
+      print('REPL is OFF, will sleep shortly') # button is OFF
+      sleep(5) # time for blynk.run to process virtual write ??
+      
+      print('disconnect from blynk and wifi ')
+      blynk.disconnect()
+      sleep(1)
+      wifi.disconnect()
+      sleep(1)
+
+      print ('script execution time(ms): ', ticks_ms()-start_time)
+
+      print('go to deep sleep until next measure ', sleep_sec_measure)
+      go_to_deepsleep(sleep_sec_measure)
+
+  except Exception as e:
+    s = '%d %d %2d: exception in end app: %s' %(mday, hour, minute, str(e))
+    print(s)
+    f.write(s)
+
     print('disconnect from blynk and wifi ')
     blynk.disconnect()
     sleep(1)
     wifi.disconnect()
     sleep(1)
-
-    print ('script execution time(ms): ', ticks_ms()-start_time)
-
-    print('go to deep sleep until next measure ', sleep_sec_measure)
     go_to_deepsleep(sleep_sec_measure)
+
 
 # end app
 
@@ -992,145 +1123,186 @@ def end_app(a):
 # start wifi and update time with ntp
 # start watchdog, end_app, blynk_reconnect, blynk_ping thread
 # run Blynk (call backs, connect and run)
+# entiere main is protected with try
 ############################
 
 # project meaudre, cloud server
 # public blynk server
 
-init_RTC([1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+# protect ALL main
+try:
 
-blynk = blynklib.Blynk(mynet.token) # auth token configured in mynet.py token = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
-print ('BLYNK: blynk on public server created: ' , type(blynk))
+  # define as global if in try: and not in straigh main
+  global wifi
+  global offset, scale, driver
 
-#There are two hardware I2C peripherals with identifiers 0 and 1. Any available output-capable pins can be used for SCL and SDA but the defaults are given below.
-#https://docs.micropython.org/en/latest/esp32/quickref.html#hardware-i2c-bus
+  init_RTC([1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+
+  blynk = blynklib.Blynk(mynet.token) # auth token configured in mynet.py token = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+  print ('BLYNK: blynk on public server created: ' , type(blynk))
+
+  #There are two hardware I2C peripherals with identifiers 0 and 1. Any available output-capable pins can be used for SCL and SDA but the defaults are given below.
+  #https://docs.micropython.org/en/latest/esp32/quickref.html#hardware-i2c-bus
 
 
-print('power sensors with gpio')
-lux_power_pin.on()
-bme_power_pin.on()
-load_power_pin.on()
-sleep_ms(100)
+  print('power sensors with gpio')
+  lux_power_pin.on()
+  bme_power_pin.on()
+  load_power_pin.on()
+  sleep_ms(100)
 
-print("start i2c and scan")
-i2c = I2C(scl=Pin(scl), sda=Pin(sda))
-#i2c = I2C(1,scl=Pin(scl), sda=Pin(sda), freq=4000000)
-if i2c == None:
-    raise ValueError('I2C create failed. deep sleep')
+  print("start i2c and scan")
+  i2c = I2C(scl=Pin(scl), sda=Pin(sda))
+  #i2c = I2C(1,scl=Pin(scl), sda=Pin(sda), freq=4000000)
+  if i2c == None:
+      #raise ValueError('I2C create failed. deep sleep')
+      go_to_deepsleep(sleep_sec_error)
+  else:
+    print('i2C CREATED, scan bus', i2c)
+
+  devices = i2c.scan()
+  if len(devices) == 0:
+    print("no i2c devices. deep sleep")
     go_to_deepsleep(sleep_sec_error)
-else:
-  print('i2C CREATED, scan bus', i2c)
+  else:
+    print ("devices list: ", devices) 
+    print ("devices in hexa")
+    for x in devices:
+      print (hex(x), end= ' ')
+    print(' ')
+  """
+  devices:  [54, 60]
+  list devices in hexa
+  0x36
+  0x3c
+  """
+  if len(devices) != 3:
+    missing_sensor = True
+  else:
+    missing_sensor = False
 
-devices = i2c.scan()
-if len(devices) == 0:
-  print("no i2c devices. deep sleep")
-  go_to_deepsleep(sleep_sec_error)
-else:
-  print ("devices list: ", devices) 
-  print ("devices in hexa")
-  for x in devices:
-    print (hex(x), end= ' ')
-  print(' ')
-"""
-devices:  [54, 60]
-list devices in hexa
-0x36
-0x3c
-"""
-if len(devices) != 3:
-  missing_sensor = True
-else:
-  missing_sensor = False
+  print('create hx711 driver')
+  driver = HX711(d_out=34, pd_sck=32)
+  driver.channel= HX711.CHANNEL_A_64 # retrieving data from the channel 'A' with gain 128 and 64, 
+  # offset and scale done with gain 64
+  if driver == None:
+      raise ValueError('load driver create failed. deep sleep')
+      go_to_deepsleep(sleep_sec_error)
+  else:
+    print('HX711 load driver created ', driver)
 
-print('create hx711 driver')
-driver = HX711(d_out=34, pd_sck=32)
-driver.channel= HX711.CHANNEL_A_64 # retrieving data from the channel 'A' with gain 128 and 64, 
-# offset and scale done with gain 64
-if driver == None:
-    raise ValueError('load driver create failed. deep sleep')
+  offset = 254000 # avec plateau
+  # 41xxx for 4700 grams , 4 cells
+  scale = 41500/4700
+
+
+  ###############################################
+  # start wifi
+  # credential for wifi stored in mynet.py
+  ################################################
+  """
+  net = [
+  ['ssid1', 'pass1'] , \
+  ['ssid2', 'pass2'] \
+  ]
+  """
+
+  import mynet
+  print('start wifi ', mynet.net)
+
+  sta_if = network.WLAN(network.STA_IF)
+  sta_if.active(True)
+  sta_if.ifconfig(('192.168.1.181', '255.255.255.0','192.168.1.1', '8.8.8.8'))
+
+  #wifi_ok = False
+
+  # try to connect to all configured wifi
+  for i in range(len(mynet.net)):
+    print("\ntrying to connect to wifi %s ..." %(mynet.net[i][0]))
+
+    wifi = wifi_connect(mynet.net[i][0], mynet.net[i][1], sta_if)
+    
+    if wifi != None:
+      (ip, _,_,_) = wifi.ifconfig()
+      print('\n************** wifi connected **************\n')
+      #wifi_ok = True
+      pulse_led(4,500) # long pulse for OK
+      break
+  else: # no break
+  #if (wifi_ok == False):
+    print('could not connect to any wifi')
+    # blynk on board led
+    pulse_led(4,100) # short pulse for error
+    error_led(5) # red led
+    
+    print('deep sleep sec: ', sleep_sec_error)
     go_to_deepsleep(sleep_sec_error)
-else:
-  print('HX711 load driver created ', driver)
 
-offset = 254000 # avec plateau
-# 41xxx for 4700 grams , 4 cells
-scale = 41500/4700
+  # set local time from ntp server. 
+  print('local time before ntp: ', localtime())
+  for i in range(5): # retry in case of TIMEOUT
+    try: # protect from timeout in ntp
+      print('set time with ntp')
+      ntptime.settime()
+      (year, month, mday, hour, minute, second, weekday, yearday) = localtime()
+      print('UTC time after ntp: ', localtime()) # tuple (year, month, mday, hour, minute, second, weekday, yearday)
+      # adjust in code for TZ. RTC can only run in UTC
+      t=mktime(localtime())
+      t = t + 2*3600
+      (year, month, mday, hour, minute, second, weekday, yearday) = localtime(t)
+      print('local time after TZ: ', localtime(t))
+      print('day: %d hour: %d mn: %d'%(mday, hour, minute ))
+      break
 
+    except Exception as e:
+      print('exception in ntp ', str(e))
+      # default value for time stamp, otherwize undefined
+      (year, month, mday, hour, minute, second, weekday, yearday) = localtime()
 
-###############################################
-# start wifi
-# credential for wifi stored in mynet.py
-################################################
-"""
-net = [
-['ssid1', 'pass1'] , \
-['ssid2', 'pass2'] \
-]
-"""
+      s = '%d %d %2d: exception in NTP: %s' %(mday, hour, minute, str(e))
+      print(s)
+      f.write(s)
 
-import mynet
-print('start wifi ', mynet.net)
+    finally:
 
-sta_if = network.WLAN(network.STA_IF)
-sta_if.active(True)
-sta_if.ifconfig(('192.168.1.181', '255.255.255.0','192.168.1.1', '8.8.8.8'))
+      #######################################
+      # write another boot time stamp to log file, now we got NTP
+      #######################################
+      if reset_cause() == DEEPSLEEP_RESET:
+        pass
+      else: # timestamp in log 
+        print("write time stamp to log file ", s)
+        s = '%d %d %2d: ESP32 hard boot' %(mday, hour, minute)
+        print(s)
+        f.write(s)
+        
+  ######################################
+  # start threads
+  # end_app
+  # watchdog
+  # blynk_ping
+  ######################################
 
-#wifi_ok = False
+  _thread.start_new_thread(end_app, ('pabou',))  # param need to be a tuple
+  # will wait for blynk to run and read sensors, button to sync and call deep sleep or webrepl
 
-# try to connect to all configured wifi
-for i in range(len(mynet.net)):
-  print("\ntrying to connect to wifi %s ..." %(mynet.net[i][0]))
+  # force deep sleep
+  _thread.start_new_thread(watchdog, (120,))  # param need to be a tuple
 
-  wifi = wifi_connect(mynet.net[i][0], mynet.net[i][1], sta_if)
-  
-  if wifi != None:
-    (ip, _,_,_) = wifi.ifconfig()
-    print('\n************** wifi connected **************\n')
-    #wifi_ok = True
-    pulse_led(4,500) # long pulse for OK
-    break
-else: # no break
-#if (wifi_ok == False):
-  print('could not connect to any wifi')
-  # blynk on board led
-  pulse_led(4,100) # short pulse for error
-  error_led(5) # red led
-  
-  print('deep sleep sec: ', sleep_sec_error)
+  #_thread.start_new_thread(blynk_reconnect, (90,))  # param need to be a tuple
+
+  # keep blynk opened while in repl
+  _thread.start_new_thread(blynk_ping, (10,))  # param need to be a tuple
+
+  # run blynk in main
+  blynk_thread(('pabou',)) # block at blynk.run() waiting for inbound event
+
+except Exception as e:
+  s = '%d %d %2d: exception in main: %s' %(mday, hour, minute, str(e))
+  print(s)
+  f.write(s)
+  print('exception in running main, ', str(e))
   go_to_deepsleep(sleep_sec_error)
-
-# set local time from ntp server. 
-print('local time before ntp: ', localtime())
-for i in range(5): # retry in case of TIMEOUT
-  try: # protect from timeout in ntp
-    print('set time with ntp')
-    ntptime.settime()
-    (year, month, mday, hour, minute, second, weekday, yearday) = localtime()
-    print('UTC time after ntp: ', localtime()) # tuple (year, month, mday, hour, minute, second, weekday, yearday)
-    # adjust in code for TZ. RTC can only run in UTC
-    t=mktime(localtime())
-    t = t + 2*3600
-    (year, month, mday, hour, minute, second, weekday, yearday) = localtime(t)
-    print('local time after TZ: ', localtime(t))
-    print('day: %d hour: %d mn: %d'%(mday, hour, minute ))
-    break
-
-  except Exception as e:
-    print('exception in ntp ', str(e))
-    # default value for time stamp, otherwize undefined
-    (year, month, mday, hour, minute, second, weekday, yearday) = localtime()
-    sleep(2)
-
-_thread.start_new_thread(end_app, ('pabou',))  # param need to be a tuple
-# will wait for blynk to run, button to sync and call deep sleep or webrepl
-
-_thread.start_new_thread(watchdog, (120,))  # param need to be a tuple
-
-#_thread.start_new_thread(blynk_reconnect, (90,))  # param need to be a tuple
-
-_thread.start_new_thread(blynk_ping, (10,))  # param need to be a tuple
-
-# run blynk in main
-blynk_thread(('pabou',)) # block at blynk.run() waiting for inbound event
+  
 
 
